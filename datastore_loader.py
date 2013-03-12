@@ -7,16 +7,6 @@ import urllib2, json, cStringIO, hashlib
 from datetime import datetime
 from ckan_client import CkanClient, CkanApiError, CkanAccessDenied
 
-# Command-line arguments
-
-parser = argparse.ArgumentParser(description='Load a CKAN resource into the Datastore.')
-parser.add_argument('base_url', type=str, help='The CKAN base URL, e.g. http://www.example.org')
-parser.add_argument('api_key', type=str, help='A CKAN API key that can edit the resource.')
-parser.add_argument('resource_id', type=str, nargs="?", help='The resource GUID, or omit to load all resources in the CKAN catalog.')
-parser.add_argument('--cache', action="store_true", help='Cache the resource data file locally to make testing faster.')
-parser.add_argument('--ifchanged', action="store_true", help='Only load resources into the datastore if the content has changed.')
-args = parser.parse_args()
-
 # Configure Logging
 
 logging.basicConfig(format="%(message)s")
@@ -33,26 +23,26 @@ class UnhandledError(Exception):
 	def __init__(self, msg):
 		super(UnhandledError, self).__init__(msg)
 
-ckan = CkanClient(args.base_url, args.api_key)
+# Command-line arguments
 
-def ckan_action(action, params, squash_errors_if=None):
+def ckan_action(ckan, action, params, squash_errors_if=None):
 	try:
 		return ckan.action(action, params, squash_errors_if=squash_errors_if)
 	except CkanAccessDenied as e:
 		raise UserError(str(e))
 	except Exception as e:
-		raise UnhandledError(str(e))
+		raise UnhandledError("CKAN API call failed: " + str(e))
 
 # Main routines.
 
-def upload_resource_to_datastore(resource):
+def upload_resource_to_datastore(resource, if_changed, locally_cache_content, ckan):
 	# This is the main function of this module. It takes a
 	# resource (a dict as returned from resource_show), downloads
 	# the content, parses the content as a table, and uploads
 	# it into the CKAN datastore.
 
 	# Download the resource.
-	resource_file, mime_type, fileext = load_resource_content(resource)
+	resource_file, mime_type, fileext = load_resource_content(resource, locally_cache_content)
 	
 	# Get the SHA1 hash of the resource content.
 	sha = hashlib.sha1()
@@ -61,7 +51,7 @@ def upload_resource_to_datastore(resource):
 	
 	# If --ifchanged is used, only upload to the datastore if we
 	# have a new file.
-	if args.ifchanged:
+	if if_changed:
 		if resource.get("datastore_content_hash", None) == resource_hash:
 			log.info("Skipping resource --- not changed.")
 			return
@@ -69,13 +59,25 @@ def upload_resource_to_datastore(resource):
 	# From here on, resource_file is expected to be a file-like obj.
 	resource_file = cStringIO.StringIO(resource_file)
 	
+	# Get the default schema from the resource metadata.
+	default_schema = resource.get("datastore_schema", None)
+	if default_schema:
+		default_schema = json.loads(default_schema)
+	
 	# Parse the resource to get the file format, column headers, datatypes, etc.
 	# recorditer is a sequence of rows in the table, as returned from messytables.
-	schema, recorditer = parse_resource(resource_file, mime_type, fileext)
+	schema, recorditer = parse_resource(resource_file, mime_type, fileext, default_schema)
 	
+	# Before we start to load the data, clear some metadata
+	# to indicate the data is currently incomplete (especially
+	# when updating an existing resource and the upload crashes).
+	resource["datastore_last_updated"] = None
+	resource["datastore_content_hash"] = None
+	ckan_action(ckan, "resource_update", resource)
+
 	# Upload the resource to the Datastore.
 	try:
-		upload_resource_records(resource, schema, recorditer)
+		num_rows = upload_resource_records(resource, schema, recorditer, ckan)
 	except UserError as e:
 		# There was some data format error. Instead of raising
 		# the error, we should do something so that we are able
@@ -87,9 +89,10 @@ def upload_resource_to_datastore(resource):
 	resource["datastore_content_hash"] = resource_hash
 	resource["datastore_last_updated"] = datetime.utcnow().isoformat() # CKAN assumes strings that look like dates are in UTC
 	resource["datastore_schema"] = json.dumps(schema, sort_keys=True, indent=4)
-	ckan_action("resource_update", resource)
+	resource["datastore_rows"] = num_rows
+	ckan_action(ckan, "resource_update", resource)
 	
-def load_resource_content(resource):
+def load_resource_content(resource, locally_cache_content):
 	# Downloads the content of the resource file (resource["url"]).
 	#
 	# While it might be nice to support streaming the resource
@@ -98,7 +101,7 @@ def load_resource_content(resource):
 	
 	# If --cache is used, see if we already have this resource in the cache.
 	# If so, return it from the cache.
-	if args.cache:
+	if locally_cache_content:
 		import sqlite3, base64
 		conn = sqlite3.connect('cache.db')
 		c = conn.cursor()
@@ -133,7 +136,7 @@ def load_resource_content(resource):
 		
 	resource_file = resource_file.read()
 
-	if args.cache:
+	if locally_cache_content:
 		# Store the value in the cache. We'll need to slurp the
 		# resource into memory, then wrap it back in a file-like
 		# object before we return it.
@@ -144,7 +147,7 @@ def load_resource_content(resource):
 		
 	return resource_file, mime_type, fileext
 
-def parse_resource(resource_file, mime_type, fileext):
+def parse_resource(resource_file, mime_type, fileext, default_schema):
 	# Given resource data, returns a tuple of
 	#  * the schema used to load the file
 	#  * the resource as a table, as given by messytables (an iterator over rows) 
@@ -155,6 +158,12 @@ def parse_resource(resource_file, mime_type, fileext):
 	schema = {
 		"_format": 1,
 	}
+	
+	# Update defaults from the provided schema.
+	if default_schema:
+		schema.update(default_schema)
+	else:
+		schema["auto"] = True
 	
 	# Utility function that's like dict.get() but works on nested
 	# dicts and takes a path through to dicts as arguments. Returns
@@ -340,6 +349,8 @@ def parse_resource(resource_file, mime_type, fileext):
 		],
 		strict=True
 		)
+	if len(datatypes) != len(headers):
+		raise UserError("Could not guess data types. Column header count does not match rows found during type guessing.")
 	messytable_datastore_type_mapping = {
 		messytables.types.StringType: 'text',
 		messytables.types.IntegerType: 'numeric',  # 'int' may not be big enough,
@@ -372,7 +383,7 @@ def parse_resource(resource_file, mime_type, fileext):
 			
 	return schema, table
 
-def upload_resource_records(resource, schema, recorditer):
+def upload_resource_records(resource, schema, recorditer, ckan):
 	# Given the parsed resource ready to be loaded, now actually
 	# pass off the data to the Datastore API.
 
@@ -380,11 +391,11 @@ def upload_resource_records(resource, schema, recorditer):
 	# If the error from CKAN has __type == "Not Found Error",
 	# silently continue --- it means there is no datastore for
 	# this resource yet.
-	ckan_action("datastore_delete", { "resource_id": resource["id"] },
+	ckan_action(ckan, "datastore_delete", { "resource_id": resource["id"] },
 		squash_errors_if = lambda err : err["__type"] == "Not Found Error")
 	
 	# Create the datastore.
-	ckan_action("datastore_create", {
+	ckan_action(ckan, "datastore_create", {
 		"resource_id": resource["id"],
 		"fields": [
 			{
@@ -482,40 +493,53 @@ def upload_resource_records(resource, schema, recorditer):
 			rownum += 1
 			
 		# Execute API call.
-		ckan_action("datastore_upsert", {
+		ckan_action(ckan, "datastore_upsert", {
 			"resource_id": resource["id"],
 			"method": "insert",
 			"records": payload,
 			})
 		
+	return rownum
+		
 #####################################################################
 
-if args.resource_id == None:
-	# Upload all packages.
-	packages = ckan_action("package_list", {})
-	for package_id in packages:
-		# Get the package's first resource.
-		pkg = ckan_action("package_show", { "id": package_id })
-		
-		# Filter out resources to skip.
-		resources = [r for r in pkg["resources"] if r["format"].lower() not in ("api","query tool")]
-		
-		# Has  aresource to upload? Get the first.
-		if len(resources) == 0:
-			log.error("Package %s has no uploadable resources." % pkg["name"])
-			continue
-		resource = resources[0]
-
-		log.info("Processing %s/resource/%s ..." % (pkg["name"], resource["id"]))
-
-		try:
-			upload_resource_to_datastore(resource)
-		except UserError as e:
-			log.error(e)
-			
-		log.info("") # blank line please
-else:
-	# Upload a particular resource.
-	resource = ckan_action("resource_show", { "id": args.resource_id })
-	upload_resource_to_datastore(resource)
+if __name__ == "__main__":
+	parser = argparse.ArgumentParser(description='Load a CKAN resource into the Datastore.')
+	parser.add_argument('base_url', type=str, help='The CKAN base URL, e.g. http://www.example.org')
+	parser.add_argument('api_key', type=str, help='A CKAN API key that can edit the resource.')
+	parser.add_argument('resource_id', type=str, nargs="?", help='The resource GUID, or omit to load all resources in the CKAN catalog.')
+	parser.add_argument('--cache', action="store_true", help='Cache the resource data file locally to make testing faster.')
+	parser.add_argument('--ifchanged', action="store_true", help='Only load resources into the datastore if the content has changed.')
+	args = parser.parse_args()
 	
+	ckan = CkanClient(args.base_url, args.api_key)
+	
+	if args.resource_id == None:
+		# Upload all packages.
+		packages = ckan_action("package_list", {})
+		for package_id in packages:
+			# Get the package's first resource.
+			pkg = ckan_action("package_show", { "id": package_id })
+			
+			# Filter out resources to skip.
+			resources = [r for r in pkg["resources"] if r["format"].lower() not in ("api","query tool")]
+			
+			# Has  aresource to upload? Get the first.
+			if len(resources) == 0:
+				log.error("Package %s has no uploadable resources." % pkg["name"])
+				continue
+			resource = resources[0]
+	
+			log.info("Processing %s/resource/%s ..." % (pkg["name"], resource["id"]))
+	
+			try:
+				upload_resource_to_datastore(resource, args.ifchanged, args.cache, ckan)
+			except UserError as e:
+				log.error(e)
+				
+			log.info("") # blank line please
+	else:
+		# Upload a particular resource.
+		resource = ckan_action("resource_show", { "id": args.resource_id })
+		upload_resource_to_datastore(resource, args.ifchanged, args.cache, ckan)
+		

@@ -13,13 +13,17 @@
 import urllib2, json
 
 class CkanApiError(Exception):
-	def __init__(self, msg):
+	def __init__(self, err_type, msg):
 		super(CkanApiError, self).__init__(msg)
+		self.err_type = err_type
 
 class CkanAccessDenied(CkanApiError):
-	def __init__(self, msg):
-		super(CkanAccessDenied, self).__init__(msg)
+	def __init__(self, err_type, msg):
+		super(CkanAccessDenied, self).__init__(err_type, msg)
 
+class CkanNotFound(CkanApiError):
+	def __init__(self, err_type, msg):
+		super(CkanNotFound, self).__init__(err_type, msg)
 
 class CkanClient:
 	
@@ -67,21 +71,32 @@ class CkanClient:
 				if squash_errors_if(msg["error"]):
 					return None
 					
-			# If the response JSON has an "error" key, then use that
-			# as the error message. Reformat it back into JSON so we
-			# have a string.
+			# If the response JSON has an "error" key, get error
+			# information from there.
 			msg = msg["error"]
-			msg = json.dumps(msg, sort_keys=True, indent=4) 
+			
+			if "__type" in msg and "message" in msg:
+				err_type = msg["__type"]
+				msg = msg["message"]
+			else:
+				# Or as a fallback, reformat the error value back into JSON
+				# so we have a string.			
+				err_type = "unknown"
+				msg = json.dumps(msg, sort_keys=True, indent=4) 
 		except:
 			# If we can't decode the response as JSON, use the raw
 			# response as the error message.
+			err_type = "unknown"
 			msg = response_data
 			
 		if response.getcode() == 403:
 			# Custom message for 403.
-			raise CkanAccessDenied("Permission denied. CKAN indicated the API key was not valid for modifying the resource. (%s)" % msg)
+			raise CkanAccessDenied(err_type, "Permission denied. CKAN indicated the API key was not valid for modifying the resource. (%s)" % msg)
+		elif response.getcode() == 404:
+			# Custom message for 404.
+			raise CkanNotFound(err_type, "Resource not found. (%s)" % msg)
 		else:
 			# Generic message. We should not show this to the user if
 			# we can help it.
-			raise CkanApiError("CKAN API call failed: " + msg)
+			raise CkanApiError(err_type, msg)
 		
