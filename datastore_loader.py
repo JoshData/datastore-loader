@@ -5,6 +5,7 @@ import argparse, logging
 import os.path, re, unicodedata
 import urllib2, json, cStringIO, hashlib
 from datetime import datetime
+from ckan_client import CkanClient, CkanApiError, CkanAccessDenied
 
 # Command-line arguments
 
@@ -32,63 +33,15 @@ class UnhandledError(Exception):
 	def __init__(self, msg):
 		super(UnhandledError, self).__init__(msg)
 
-def ckan(action, params, error_handler=None):
-	# Invoke a CKAN API action.
-	
-	# Build the request.	
-	request = urllib2.Request(
-		"%s/api/3/action/%s" % (args.base_url, action),
-		json.dumps(params))
-	request.add_header("Content-Type", 'application/json')
-	request.add_header("Authorization", args.api_key)
-	
-	# Execute the request.
+ckan = CkanClient(args.base_url, args.api_key)
+
+def ckan_action(action, params, squash_errors_if=None):
 	try:
-		response = urllib2.urlopen(request)
-	except urllib2.HTTPError as e:
-		# HTTPError is a special exception that can be
-		# treated as an HTTP response object. We'll do
-		# an error check below.
-		response = e
-	
-	# If the response was OK, parse the JSON and return
-	# just the "result" part of the response.	
-	if response.getcode() == 200:
-		return json.load(response)["result"]
-		
-	# Call failed. Raise an exception with an informative
-	# error message.
-	
-	response_data = response.read()
-	try:
-		# Attempt to load the response as JSON.
-		msg = json.loads(response_data)
-		
-		# Allow the caller to prevent the raising of an exception.
-		# Pass the response JSON object to the error handler, and
-		# if it returns True then we'll silently ignore the error
-		# and return None.
-		if error_handler:
-			if error_handler(msg["error"]):
-				return None
-				
-		# If the response JSON has an "error" key, then use that
-		# as the error message. Reformat it back into JSON so we
-		# have a string.
-		msg = msg["error"]
-		msg = json.dumps(msg, sort_keys=True, indent=4) 
-	except:
-		# If we can't decode the response as JSON, use the raw
-		# response as the error message.
-		msg = response_data
-		
-	if response.getcode() == 403:
-		# Custom message for 403.
-		raise UserError("Permission denied. CKAN indicated the API key was not valid for modifying the resource. (%s)" % msg)
-	else:
-		# Generic message. We should not show this to the user if
-		# we can help it.
-		raise UnhandledError("CKAN API call failed: " + msg)
+		return ckan.action(action, params, squash_errors_if=squash_errors_if)
+	except CkanAccessDenied as e:
+		raise UserError(str(e))
+	except Exception as e:
+		raise UnhandledError(str(e))
 
 # Main routines.
 
@@ -134,7 +87,7 @@ def upload_resource_to_datastore(resource):
 	resource["datastore_content_hash"] = resource_hash
 	resource["datastore_last_updated"] = datetime.utcnow().isoformat() # CKAN assumes strings that look like dates are in UTC
 	resource["datastore_schema"] = json.dumps(schema, sort_keys=True, indent=4)
-	ckan("resource_update", resource)
+	ckan_action("resource_update", resource)
 	
 def load_resource_content(resource):
 	# Downloads the content of the resource file (resource["url"]).
@@ -427,11 +380,11 @@ def upload_resource_records(resource, schema, recorditer):
 	# If the error from CKAN has __type == "Not Found Error",
 	# silently continue --- it means there is no datastore for
 	# this resource yet.
-	ckan("datastore_delete", { "resource_id": resource["id"] },
-		error_handler = lambda err : err["__type"] == "Not Found Error")
+	ckan_action("datastore_delete", { "resource_id": resource["id"] },
+		squash_errors_if = lambda err : err["__type"] == "Not Found Error")
 	
 	# Create the datastore.
-	ckan("datastore_create", {
+	ckan_action("datastore_create", {
 		"resource_id": resource["id"],
 		"fields": [
 			{
@@ -529,7 +482,7 @@ def upload_resource_records(resource, schema, recorditer):
 			rownum += 1
 			
 		# Execute API call.
-		ckan("datastore_upsert", {
+		ckan_action("datastore_upsert", {
 			"resource_id": resource["id"],
 			"method": "insert",
 			"records": payload,
@@ -539,10 +492,10 @@ def upload_resource_records(resource, schema, recorditer):
 
 if args.resource_id == None:
 	# Upload all packages.
-	packages = ckan("package_list", {})
+	packages = ckan_action("package_list", {})
 	for package_id in packages:
 		# Get the package's first resource.
-		pkg = ckan("package_show", { "id": package_id })
+		pkg = ckan_action("package_show", { "id": package_id })
 		
 		# Filter out resources to skip.
 		resources = [r for r in pkg["resources"] if r["format"].lower() not in ("api","query tool")]
@@ -563,6 +516,6 @@ if args.resource_id == None:
 		log.info("") # blank line please
 else:
 	# Upload a particular resource.
-	resource = ckan("resource_show", { "id": args.resource_id })
+	resource = ckan_action("resource_show", { "id": args.resource_id })
 	upload_resource_to_datastore(resource)
 	
