@@ -225,7 +225,7 @@ def parse_resource(resource_file, mime_type, fileext, default_schema):
 		for n in ("delimiter", "quotechar", "encoding"):
 			v = schema_get("format", n)
 			if v:
-				data_format_args[n] = v
+				data_format_args[n] = str(v) # csv module requires str's not unicode
 		
 	else:
 		raise UserError("Invalid format name in schema. Allowed values are: csv, tsv.")
@@ -349,17 +349,18 @@ def parse_resource(resource_file, mime_type, fileext, default_schema):
 		],
 		strict=True
 		)
+	 
 	if len(datatypes) != len(headers):
 		raise UserError("Could not guess data types. Column header count does not match rows found during type guessing.")
 	messytable_datastore_type_mapping = {
-		messytables.types.StringType: 'text',
-		messytables.types.IntegerType: 'numeric',  # 'int' may not be big enough,
+		messytables.types.StringType: lambda t : 'text',
+		messytables.types.IntegerType: lambda t : 'bigint',  # 'int' may not be big enough,
 						# and type detection may not realize it needs to be big
-		messytables.types.FloatType: 'float',
-		messytables.types.DecimalType: 'numeric',
-		messytables.types.DateType: 'timestamp',
+		messytables.types.FloatType: lambda t : 'float',
+		messytables.types.DecimalType: lambda t : 'numeric',
+		messytables.types.DateType: lambda t : 'timestamp:' + t.format,
 	}
-	datatypes = [messytable_datastore_type_mapping[type(t)] for t in datatypes] # convert objects to strings
+	datatypes = [messytable_datastore_type_mapping[type(t)](t) for t in datatypes] # convert objects to strings
 	
 	# Override the datatypes from the schema.
 	for cidx, col in enumerate(schema_get("columns", default=[])):
@@ -378,7 +379,7 @@ def parse_resource(resource_file, mime_type, fileext, default_schema):
 		
 	# Validate that the datatypes are all legit.
 	for dt in datatypes:
-		if dt not in ("text", "int", "float", "bool", "numeric", "date", "time", "timestamp", "json"):
+		if dt.split(":")[0] not in ("text", "int", "bigint", "float", "bool", "numeric", "date", "time", "timestamp", "json"):
 			raise UserError("Invalid data type in schema: %s" % dt)
 			
 	return schema, table
@@ -400,8 +401,9 @@ def upload_resource_records(resource, schema, recorditer, ckan):
 		"fields": [
 			{
 				"id": col["name"],
-				"type": col["type"],
-			} for cidx, col in enumerate(schema["columns"]) ]
+				"type": col["type"].split(":")[0],
+			} for cidx, col in enumerate(schema["columns"]) ],
+		"primary_key": schema.get("primary_key", None),
 		})
 		# TODO: also send primary_key, indexes?
 	
@@ -429,13 +431,14 @@ def upload_resource_records(resource, schema, recorditer, ckan):
 		datastore_messytable_type_mapping = {
 			'text': messytables.types.StringType,
 			'int': messytables.types.IntegerType,
+			'bigint': messytables.types.IntegerType,
 			'float': messytables.types.FloatType,
 			'numeric': messytables.types.FloatType, # DecimalType is not JSON serializable
 			'timestamp': messytables.types.DateType,
 		}
-		typ = datastore_messytable_type_mapping[datatype]
+		typ = datastore_messytable_type_mapping[datatype.split(":")[0]]
 
-		if cell.type != None:
+		if cell.type != None and not isinstance(cell.type, messytables.types.StringType):
 			# The XLS parser does type conversion for us. Just check
 			# that the cell datatype matches the column datatype.
 			if type(cell.type) != typ:
@@ -455,7 +458,24 @@ def upload_resource_records(resource, schema, recorditer, ckan):
 
 		# Normalize the raw value.
 		try:
-			return typ().cast(cell.value)
+			if typ == messytables.types.DateType:
+				# Use the DataType class to parse the value according to
+				# the format specified like timestamp:%y/%z.
+				#
+				# The constructor for this type requires a format parameter.
+				# Check for it.
+				if ":" not in datatype: raise UserError("The %s data type requires a :FORMAT part." % datatype)
+				
+				# Cast to DateTime.
+				v = typ(datatype.split(":")[1]).cast(cell.value)
+				
+				# But since that's not JSON-serializable, send in ISO format,
+				# which PostgreSQL accepts.
+				return v.isoformat()
+			else:
+				# Cast the raw value to the intrinsic Python data type,
+				# which must also be JSON-serializable.
+				return typ().cast(cell.value)
 		except ValueError:
 			# If normalization fails, the user has provided an
 			# invalid value.
