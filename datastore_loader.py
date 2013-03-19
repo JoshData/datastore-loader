@@ -524,16 +524,17 @@ if __name__ == "__main__":
 	parser.add_argument('resource_id', type=str, nargs="?", help='The resource GUID, or omit to load all resources in the CKAN catalog.')
 	parser.add_argument('--cache', action="store_true", help='Cache the resource data file locally to make testing faster.')
 	parser.add_argument('--ifchanged', action="store_true", help='Only load resources into the datastore if the content has changed.')
+	parser.add_argument('--schema', help='Specify a schema.')
 	args = parser.parse_args()
 	
 	ckan = CkanClient(args.base_url, args.api_key)
 	
 	if args.resource_id == None:
 		# Upload all packages.
-		packages = ckan_action("package_list", {})
+		packages = ckan_action(ckan, "package_list", {})
 		for package_id in packages:
 			# Get the package's first resource.
-			pkg = ckan_action("package_show", { "id": package_id })
+			pkg = ckan_action(ckan, "package_show", { "id": package_id })
 			
 			# Filter out resources to skip.
 			resources = [r for r in pkg["resources"] if r["format"].lower() not in ("api","query tool")]
@@ -554,6 +555,7 @@ if __name__ == "__main__":
 			log.info("") # blank line please
 	else:
 		# Upload a particular resource.
-		resource = ckan_action("resource_show", { "id": args.resource_id })
+		resource = ckan_action(ckan, "resource_show", { "id": args.resource_id })
+		if args.schema: resource["datastore_schema"] = args.schema # set, or override
 		upload_resource_to_datastore(resource, args.ifchanged, args.cache, ckan)
 		
