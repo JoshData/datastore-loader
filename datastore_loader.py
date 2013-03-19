@@ -450,12 +450,6 @@ def upload_resource_records(resource, schema, recorditer, ckan):
 			# datastore, otherwise we may get an error.
 			return cell.value
 		
-		# The empty string is invalid for columns besides text,
-		# unless we treat it as a database NULL.
-		if cell.value.strip() == "" and datatype != "text":
-			return None # db NULL
-		
-
 		# Normalize the raw value.
 		try:
 			if typ == messytables.types.DateType:
