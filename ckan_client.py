@@ -6,6 +6,8 @@
 #
 # Examples:
 # 
+# from ckan_client import CkanClient
+#
 # ckan = CkanClient("http://hub.healthdata.gov", "API_KEY")
 #
 # print ckan.action("package_list", {})
@@ -51,7 +53,7 @@ class CkanClient:
 			response = e
 		
 		# If the response was OK, parse the JSON and return
-		# just the "result" part of the response.	
+		# just the "result" part of the response.
 		if response.getcode() == 200:
 			return json.load(response)["result"]
 			
